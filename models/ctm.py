@@ -119,6 +119,15 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
 
+        # --- Thought-Trace Normalizer & Stability Guard ---
+        # Feature 1: Fix numerical stability issues and prevent training collapse
+        beta = 0.9  # EMA smoothing factor for per-neuron normalization
+        self.register_buffer('neuron_ema', torch.zeros(d_model) + 1e-6)  # Per-neuron EMA of absolute values
+        self.register_buffer('beta', torch.tensor(beta))  # EMA decay rate
+        self.register_buffer('eps', torch.tensor(1e-8))  # Epsilon for numerical stability
+        self.register_buffer('cv_threshold', torch.tensor(3.0))  # Coefficient of variation threshold
+        self.rescale_factor = 0.9  # Gentle rescaling factor to prevent oscillations
+
         # --- Assertions ---
         self.verify_args()
 
@@ -266,7 +275,10 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             decay_alpha = r * decay_alpha + pairwise_product
             decay_beta = r * decay_beta + 1
         
-        synchronisation = decay_alpha / (torch.sqrt(decay_beta))
+        # --- FIXED: Safe sqrt operation with ABS/CLAMP to prevent NaN/Inf values ---
+        # This fixes Issue #3 from security analysis: "Unsafe sqrt operations"
+        sqrt_beta = torch.sqrt(torch.clamp(decay_beta, min=0) + self.eps)
+        synchronisation = decay_alpha / sqrt_beta
         return synchronisation, decay_alpha, decay_beta
 
     def compute_features(self, x):
@@ -552,6 +564,48 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         """
         self.use_gradient_checkpointing = enable
 
+    def apply_thought_trace_normalizer(self, activated_state):
+        """
+        Feature 1: Thought-Trace Normalizer & Stability Guard
+        Applies per-neuron EMA normalization and stability guard to prevent training collapse.
+
+        Fixes critical numerical stability issues:
+        - Unsafe square root operations (Issue #3 from security analysis)
+        - Unsafe division operations (Issue #4 from security analysis)
+
+        Args:
+            activated_state: (B, d_model) - Current activated state
+
+        Returns:
+            normalized_state: (B, d_model) - Stabilized activated state
+        """
+        # --- Per-Neuron EMA Normalization ---
+        # Update EMA per neuron (batch-wise) with epsilon guards
+        abs_state = activated_state.abs()
+        self.neuron_ema.data = self.beta * self.neuron_ema.data + (1 - self.beta) * abs_state.mean(dim=0)
+
+        # Normalize per-neuron with epsilon to prevent division by zero
+        normalized = activated_state / (self.eps + self.neuron_ema.unsqueeze(0))
+
+        # --- Stability Guard with CV Monitoring ---
+        # Compute coefficient of variation across neurons with epsilon guards
+        # Uses ABS/CLAMP for sqrt operations to prevent NaN/Inf values
+        std_vals = normalized.std(dim=1, keepdim=True)
+        mean_abs_vals = normalized.mean(dim=1, keepdim=True).abs()
+        cv = std_vals / (self.eps + mean_abs_vals)
+
+        # --- Gentle Rescaling if CV exceeds threshold ---
+        # Prevents training collapse with bounded rescaling
+        mask = cv > self.cv_threshold
+        rescale = torch.where(
+            mask,
+            (self.cv_threshold / (self.eps + cv)) * self.rescale_factor,
+            torch.ones_like(cv)
+        )
+        stabilized = normalized * rescale
+
+        return stabilized
+
 
 
 
@@ -623,6 +677,11 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                 )
             else:
                 activated_state = self.trace_processor(state_trace)
+
+            # --- Apply Thought-Trace Normalizer & Stability Guard (Feature 1) ---
+            # Fix numerical stability issues: unsafe sqrt and division operations
+            activated_state = self.apply_thought_trace_normalizer(activated_state)
+
             # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
             # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
             # done using only the currect activated state (see compute_synchronisation method for explanation)
