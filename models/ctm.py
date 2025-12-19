@@ -2,6 +2,7 @@ import torch.nn as nn
 import torch
 import numpy as np
 import math
+from torch.utils.checkpoint import checkpoint
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 
 from models.modules import ParityBackbone, SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D, ShallowWide
@@ -79,26 +80,27 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
     """                               
 
     def __init__(self,
-                 iterations,
-                 d_model,
-                 d_input,
-                 heads,
-                 n_synch_out,
-                 n_synch_action,
-                 synapse_depth,
-                 memory_length,
-                 deep_nlms,
-                 memory_hidden_dims,
-                 do_layernorm_nlm,
-                 backbone_type,
-                 positional_embedding_type,
-                 out_dims,
-                 prediction_reshaper=[-1],
-                 dropout=0,
-                 dropout_nlm=None,
-                 neuron_select_type='random-pairing',  
-                 n_random_pairing_self=0,
-                 ):
+                  iterations,
+                  d_model,
+                  d_input,
+                  heads,
+                  n_synch_out,
+                  n_synch_action,
+                  synapse_depth,
+                  memory_length,
+                  deep_nlms,
+                  memory_hidden_dims,
+                  do_layernorm_nlm,
+                  backbone_type,
+                  positional_embedding_type,
+                  out_dims,
+                  prediction_reshaper=[-1],
+                  dropout=0,
+                  dropout_nlm=None,
+                  neuron_select_type='random-pairing',  
+                  n_random_pairing_self=0,
+                  use_gradient_checkpointing=False,
+                  ):
         super(ContinuousThoughtMachine, self).__init__()
 
         # --- Core Parameters ---
@@ -114,6 +116,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.positional_embedding_type = positional_embedding_type
         self.neuron_select_type = neuron_select_type
         self.memory_length = memory_length
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
 
         # --- Assertions ---
@@ -521,6 +524,34 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             raise ValueError(f"Invalid neuron selection type: {self.neuron_select_type}")
         return synch_representation_size
 
+    def _checkpointed_synapses(self, pre_synapse_input):
+        """
+        Wrapper for synapses that can be used with gradient checkpointing.
+        Gradient checkpointing requires the function to return tensors.
+        """
+        return self.synapses(pre_synapse_input)
+
+    def _checkpointed_trace_processor(self, state_trace):
+        """
+        Wrapper for trace_processor that can be used with gradient checkpointing.
+        Gradient checkpointing requires the function to return tensors.
+        """
+        return self.trace_processor(state_trace)
+
+    def set_gradient_checkpointing(self, enable: bool):
+        """
+        Enable or disable gradient checkpointing at runtime.
+        
+        Args:
+            enable (bool): If True, gradient checkpointing is enabled during training.
+                           If False, standard forward pass is used.
+        
+        Example:
+            model.set_gradient_checkpointing(True)  # Enable
+            model.set_gradient_checkpointing(False)  # Disable
+        """
+        self.use_gradient_checkpointing = enable
+
 
 
 
@@ -568,13 +599,30 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             attn_out = attn_out.squeeze(1)
             pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
 
-            # --- Apply Synapses ---
-            state = self.synapses(pre_synapse_input)
+            # --- Apply Synapses (with optional gradient checkpointing) ---
+            if self.training and self.use_gradient_checkpointing:
+                # Use gradient checkpointing to save memory during training
+                state = checkpoint(
+                    self._checkpointed_synapses,
+                    pre_synapse_input,
+                    use_reentrant=False
+                )
+            else:
+                state = self.synapses(pre_synapse_input)
+            
             # The 'state_trace' is the history of incoming pre-activations
             state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
 
-            # --- Apply Neuron-Level Models ---
-            activated_state = self.trace_processor(state_trace)
+            # --- Apply Neuron-Level Models (with optional gradient checkpointing) ---
+            if self.training and self.use_gradient_checkpointing:
+                # Use gradient checkpointing to save memory during training
+                activated_state = checkpoint(
+                    self._checkpointed_trace_processor,
+                    state_trace,
+                    use_reentrant=False
+                )
+            else:
+                activated_state = self.trace_processor(state_trace)
             # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
             # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
             # done using only the currect activated state (see compute_synchronisation method for explanation)
