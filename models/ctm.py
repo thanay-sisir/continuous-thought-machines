@@ -4,6 +4,8 @@ import numpy as np
 import math
 from torch.utils.checkpoint import checkpoint
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
+import time
+import gc
 
 from models.modules import ParityBackbone, SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D, ShallowWide
 from models.resnet import prepare_resnet_backbone
@@ -97,9 +99,12 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                   prediction_reshaper=[-1],
                   dropout=0,
                   dropout_nlm=None,
-                  neuron_select_type='random-pairing',  
+                  neuron_select_type='random-pairing',
                   n_random_pairing_self=0,
                   use_gradient_checkpointing=False,
+                  # Interpretability Dashboard Parameters
+                  enable_interpretability=False,
+                  interpretability_config=None,
                   ):
         super(ContinuousThoughtMachine, self).__init__()
 
@@ -119,6 +124,20 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
 
+        # --- Interpretability Dashboard Integration ---
+        self.enable_interpretability = enable_interpretability
+        self.interpretability_step_count = 0
+        self.interpretability_metrics = {
+            'synchrony_data': [],
+            'certainty_data': [],
+            'performance_data': [],
+            'memory_usage': [],
+            'step_times': []
+        }
+
+        if self.enable_interpretability:
+            self._init_interpretability_dashboard(interpretability_config)
+
         # --- Thought-Trace Normalizer & Stability Guard ---
         # Feature 1: Fix numerical stability issues and prevent training collapse
         beta = 0.9  # EMA smoothing factor for per-neuron normalization
@@ -130,6 +149,227 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
         # --- Assertions ---
         self.verify_args()
+
+    def _init_interpretability_dashboard(self, config):
+        """Initialize interpretability dashboard configuration"""
+        if config is None:
+            config = {
+                'mode': 'production',
+                'synchrony_frequency': 10,
+                'sample_neurons': 100,
+                'performance_threshold': 40,
+                'memory_limit_mb': 2000
+            }
+
+        self.interpretability_config = config
+        self.synchrony_frequency = config.get('synchrony_frequency', 10)
+        self.sample_neurons = config.get('sample_neurons', min(100, self.d_model))
+        self.performance_threshold = config.get('performance_threshold', 40)
+        self.memory_limit_mb = config.get('memory_limit_mb', 2000)
+        self.mode = config.get('mode', 'production')
+
+        # Validate configuration
+        self.sample_neurons = min(self.sample_neurons, self.d_model)
+        self.synchrony_frequency = max(1, self.synchrony_frequency)
+        self.performance_threshold = max(0, min(100, self.performance_threshold))
+
+    def _compute_synchrony_optimized(self, activations):
+        """Optimized synchrony computation with sampling"""
+        try:
+            if activations.numel() == 0:
+                return 0.0, 0.0
+
+            # Sample neurons for performance
+            if self.sample_neurons < self.d_model:
+                indices = torch.randperm(self.d_model)[:self.sample_neurons]
+                sampled_activations = activations[:, indices]
+            else:
+                sampled_activations = activations
+
+            # Compute correlation matrix
+            if sampled_activations.shape[1] < 2:
+                return 0.0, 0.0
+
+            # Add small epsilon to prevent numerical issues
+            epsilon = 1e-8
+            sampled_activations = sampled_activations + torch.randn_like(sampled_activations) * epsilon
+
+            # Compute synchrony using efficient numpy operations
+            corr_matrix = np.corrcoef(sampled_activations.cpu().numpy())
+            np.fill_diagonal(corr_matrix, 0)  # Remove self-correlation
+
+            # Calculate metrics
+            avg_synchrony = np.mean(np.abs(corr_matrix))
+            synchrony_variance = np.var(np.abs(corr_matrix))
+
+            return float(avg_synchrony), float(synchrony_variance)
+
+        except Exception as e:
+            return 0.0, 0.0
+
+    def _compute_certainty_metrics(self, predictions):
+        """Compute certainty metrics including entropy and variance"""
+        try:
+            if predictions.numel() == 0:
+                return 0.0, 0.0, 0.0
+
+            # Convert to probabilities
+            probabilities = torch.softmax(predictions, dim=-1)
+
+            # Compute confidence (max probability)
+            confidence = torch.max(probabilities, dim=-1)[0].mean().item()
+
+            # Compute entropy
+            entropy = -torch.sum(probabilities * torch.log(probabilities + 1e-8), dim=-1).mean().item()
+
+            # Compute variance
+            variance = torch.var(probabilities, dim=-1).mean().item()
+
+            return confidence, entropy, variance
+
+        except Exception as e:
+            return 0.0, 0.0, 0.0
+
+    def _get_performance_metrics(self):
+        """Get current performance metrics"""
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / 1024 / 1024
+
+            # Calculate performance metrics
+            avg_step_time = np.mean(self.interpretability_metrics['step_times']) if self.interpretability_metrics['step_times'] else 0.0
+
+            return {
+                'memory_mb': memory_mb,
+                'avg_step_time': avg_step_time,
+                'total_steps': len(self.interpretability_metrics['step_times']),
+                'performance_overhead': self._estimate_performance_overhead()
+            }
+        except:
+            return {
+                'memory_mb': 0.0,
+                'avg_step_time': 0.0,
+                'total_steps': 0,
+                'performance_overhead': 0.0
+            }
+
+    def _estimate_performance_overhead(self):
+        """Estimate performance overhead from interpretability monitoring"""
+        # Simple heuristic based on monitoring frequency and sampling
+        base_overhead = 5.0  # Base overhead percentage
+        frequency_factor = min(self.synchrony_frequency, 10) / 10.0
+        sampling_factor = self.sample_neurons / self.d_model
+
+        estimated_overhead = base_overhead * frequency_factor * sampling_factor
+        return min(estimated_overhead, 50.0)  # Cap at 50%
+
+    def get_interpretability_metrics(self):
+        """Get current interpretability metrics"""
+        if not self.enable_interpretability:
+            return {}
+
+        synchrony_data = self.interpretability_metrics['synchrony_data']
+        certainty_data = self.interpretability_metrics['certainty_data']
+
+        result = {
+            'synchrony': {
+                'avg_synchrony': np.mean([s[0] for s in synchrony_data]) if synchrony_data else 0.0,
+                'synchrony_variance': np.mean([s[1] for s in synchrony_data]) if synchrony_data else 0.0,
+                'stability_score': self._calculate_stability_score(synchrony_data),
+                'time_series': synchrony_data[-50:]  # Last 50 steps
+            },
+            'certainty': {
+                'avg_confidence': np.mean([c[0] for c in certainty_data]) if certainty_data else 0.0,
+                'avg_entropy': np.mean([c[1] for c in certainty_data]) if certainty_data else 0.0,
+                'avg_variance': np.mean([c[2] for c in certainty_data]) if certainty_data else 0.0,
+                'time_series': certainty_data[-50:]  # Last 50 steps
+            },
+            'performance': self._get_performance_metrics(),
+            'config': self.interpretability_config
+        }
+
+        return result
+
+    def _calculate_stability_score(self, synchrony_data):
+        """Calculate stability score based on synchrony variance"""
+        if len(synchrony_data) < 2:
+            return 1.0
+
+        variances = [s[1] for s in synchrony_data]
+        if not variances:
+            return 1.0
+
+        avg_variance = np.mean(variances)
+        # Inverse relationship: lower variance = higher stability
+        stability_score = 1.0 / (1.0 + avg_variance)
+        return min(stability_score, 1.0)
+
+    def reset_interpretability_metrics(self):
+        """Reset interpretability metrics"""
+        self.interpretability_metrics = {
+            'synchrony_data': [],
+            'certainty_data': [],
+            'performance_data': [],
+            'memory_usage': [],
+            'step_times': []
+        }
+        self.interpretability_step_count = 0
+
+    def cleanup_interpretability_data(self):
+        """Clean up old interpretability data to prevent memory leaks"""
+        max_data_points = 1000  # Keep last 1000 data points
+
+        for key in self.interpretability_metrics:
+            if isinstance(self.interpretability_metrics[key], list):
+                if len(self.interpretability_metrics[key]) > max_data_points:
+                    self.interpretability_metrics[key] = self.interpretability_metrics[key][-max_data_points:]
+
+    def _monitor_step_interpretability(self, activations, predictions, step_time):
+        """Monitor interpretability metrics for current step"""
+        if not self.enable_interpretability or not self.training:
+            return
+
+        try:
+            # Track step count
+            self.interpretability_step_count += 1
+
+            # Memory monitoring
+            if self.interpretability_step_count % 10 == 0:  # Every 10 steps
+                try:
+                    import psutil
+                    process = psutil.Process()
+                    memory_mb = process.memory_info().rss / 1024 / 1024
+                    self.interpretability_metrics['memory_usage'].append(memory_mb)
+
+                    # Memory cleanup if needed
+                    if memory_mb > self.memory_limit_mb:
+                        self.cleanup_interpretability_data()
+                        gc.collect()
+
+                except:
+                    pass
+
+            # Performance monitoring
+            self.interpretability_metrics['step_times'].append(step_time)
+
+            # Synchrony monitoring (adaptive frequency)
+            if (self.interpretability_step_count % self.synchrony_frequency == 0 and
+                self.mode != 'production'):  # Skip in production for performance
+                avg_synchrony, synchrony_variance = self._compute_synchrony_optimized(activations)
+                self.interpretability_metrics['synchrony_data'].append((avg_synchrony, synchrony_variance))
+
+            # Certainty monitoring
+            confidence, entropy, variance = self._compute_certainty_metrics(predictions)
+            self.interpretability_metrics['certainty_data'].append((confidence, entropy, variance))
+
+            # Periodic cleanup
+            if self.interpretability_step_count % 100 == 0:
+                self.cleanup_interpretability_data()
+
+        except Exception as e:
+            # Silent fail to prevent interpretability monitoring from breaking training
+            pass
 
         # --- Input Processing  ---
         d_backbone = self.get_d_backbone()
@@ -609,9 +849,25 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
 
 
-    def forward(self, x, track=False):
+    def forward(self, x, track=False, monitor_interpretability=None):
+        """
+        Forward pass with optional interpretability monitoring.
+
+        Args:
+            x: Input tensor
+            track: Enable detailed tracking (existing functionality)
+            monitor_interpretability: Override interpretability monitoring (True/False/None)
+
+        Returns:
+            predictions, certainties, synchronisation_out (base case)
+            OR predictions, certainties, synchronisation_out, interpretability_metrics (if interpretability enabled)
+        """
         B = x.size(0)
         device = x.device
+
+        # --- Determine Interpretability Monitoring ---
+        should_monitor = (monitor_interpretability if monitor_interpretability is not None
+                         else (self.enable_interpretability and self.training))
 
         # --- Tracking Initialization ---
         pre_activations_tracking = []
@@ -682,6 +938,12 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             # Fix numerical stability issues: unsafe sqrt and division operations
             activated_state = self.apply_thought_trace_normalizer(activated_state)
 
+            # --- Interpretability Monitoring ---
+            if should_monitor:
+                step_start_time = time.perf_counter()
+                # Monitor interpretability metrics
+                self._monitor_step_interpretability(activated_state, current_prediction, 0.0)  # Will be updated later
+
             # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
             # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
             # done using only the currect activated state (see compute_synchronisation method for explanation)
@@ -705,6 +967,15 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                 synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
 
         # --- Return Values ---
+        result = (predictions, certainties, synchronisation_out)
+
+        if should_monitor:
+            interpretability_metrics = self.get_interpretability_metrics()
+            if track:
+                return result + (interpretability_metrics, np.array(synch_out_tracking), np.array(synch_action_tracking), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking))
+            else:
+                return result + (interpretability_metrics,)
+
         if track:
             return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
         return predictions, certainties, synchronisation_out
